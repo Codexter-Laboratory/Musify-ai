@@ -54,11 +54,18 @@ const Map<String, ({String family, List<String> patterns})> _genres = {
   ),
   'rock': (
     family: 'rock',
-    patterns: ['rock', 'grunge', 'post-punk', 'hard rock'],
+    patterns: [
+      'rock',
+      'grunge',
+      'post-punk',
+      'punk rock',
+      'pop punk',
+      'hard rock',
+    ],
   ),
   'metal': (
     family: 'rock',
-    patterns: ['metal', 'metalcore', 'deathcore', 'hardcore', 'punk'],
+    patterns: ['metal', 'metalcore', 'deathcore', 'hardcore'],
   ),
   'edm': (
     family: 'electronic',
@@ -291,6 +298,7 @@ class VibeProfile {
     required this.genres,
     required this.moods,
     required this.energy,
+    this.energyKnown = true,
     this.durationSeconds,
     this.hasRichMetadata = false,
   });
@@ -306,6 +314,10 @@ class VibeProfile {
 
   /// 0 (very calm) .. 1 (very intense).
   final double energy;
+
+  /// False when nothing in the metadata hinted at the energy, so [energy] is
+  /// just the neutral default and must not be held against the track.
+  final bool energyKnown;
   final int? durationSeconds;
 
   /// False when the profile came from a title alone (search/related results
@@ -398,6 +410,7 @@ VibeProfile buildVibeProfile({
     genres: genres,
     moods: moods,
     energy: energy,
+    energyKnown: priors.isNotEmpty || low > 0 || high > 0,
     durationSeconds: durationSeconds,
     hasRichMetadata: hasRich,
   );
@@ -423,7 +436,10 @@ double scoreVibeMatch(
 }) {
   var score = 0.0;
 
-  // Genre: sharing the exact genre counts most, a neighbouring one less.
+  // Genre: sharing the exact genre counts most, a neighbouring one less. A
+  // track with no detectable genre is a gamble, so it ranks below a known
+  // match but above a known clash.
+  if (seed.genres.isNotEmpty && candidate.genres.isEmpty) score -= 1;
   if (seed.genres.isNotEmpty && candidate.genres.isNotEmpty) {
     var best = -2.0;
     for (final cg in candidate.genres) {
@@ -449,7 +465,9 @@ double scoreVibeMatch(
   }
 
   // Energy: staying close keeps the same loudness / tempo feel.
-  score -= 5 * (seed.energy - candidate.energy).abs();
+  if (seed.energyKnown && candidate.energyKnown) {
+    score -= 5 * (seed.energy - candidate.energy).abs();
+  }
 
   // A little same-artist bonus, but not enough to turn it into an artist radio.
   if (candidate.artist.isNotEmpty &&
@@ -464,9 +482,9 @@ double scoreVibeMatch(
     final ratio = cd / sd;
     if (ratio < 0.4 || ratio > 2.5) score -= 1.5;
   }
-  if (cd != null && cd > 15 * 60 && (sd ?? 0) <= 15 * 60) score -= 3;
+  if (cd != null && cd > 15 * 60 && (sd ?? 0) <= 15 * 60) score -= 6;
 
-  if (looksLikeNonSong(candidateTitle)) score -= 3;
+  if (looksLikeNonSong(candidateTitle)) score -= 4;
 
   if (relatedRank != null && relatedCount > 0) {
     score += 1.5 * (1 - relatedRank / relatedCount);
@@ -511,4 +529,53 @@ List<T> limitPerArtist<T>(
     }
   }
   return out;
+}
+
+/// A track under consideration for the vibe queue.
+class VibeCandidate {
+  VibeCandidate({required this.profile, required this.title, this.relatedRank});
+
+  VibeProfile profile;
+  String title;
+
+  /// 0-based position in the seed's related list, null if found by search.
+  final int? relatedRank;
+  double score = 0;
+}
+
+/// Scores [candidates] against [seed] and returns the best [limit], best
+/// first, with at most two songs per artist.
+///
+/// Candidates scoring at least [goodScore] are always preferred. If fewer than
+/// half of [limit] qualify, the next best ones scoring at least [floorScore]
+/// fill the gap so the queue does not run dry; anything below the floor
+/// clashes too much with the seed and is dropped.
+List<VibeCandidate> selectVibeMatches(
+  VibeProfile seed,
+  List<VibeCandidate> candidates, {
+  required int relatedCount,
+  int limit = 10,
+  double goodScore = -1,
+  double floorScore = -3,
+}) {
+  for (final c in candidates) {
+    c.score = scoreVibeMatch(
+      seed,
+      c.profile,
+      c.title,
+      relatedRank: c.relatedRank,
+      relatedCount: relatedCount,
+    );
+  }
+  final sorted = [...candidates]..sort((a, b) => b.score.compareTo(a.score));
+
+  final good = sorted.where((c) => c.score >= goodScore).toList();
+  final pool = good.length >= limit / 2
+      ? good
+      : sorted.where((c) => c.score >= floorScore).toList();
+
+  return limitPerArtist<VibeCandidate>(
+    pool,
+    (c) => c.profile.artist,
+  ).take(limit).toList();
 }

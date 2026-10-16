@@ -18,6 +18,46 @@ void main() {
     });
   });
 
+  group('insertIndexAfterManualSongs', () {
+    Map song(String id, {bool manual = false, bool auto = false}) => {
+      'ytid': id,
+      if (manual) 'isManuallyAdded': true,
+      if (auto) 'isAutoPicked': true,
+    };
+
+    test('goes right after the current song when nothing was queued', () {
+      final queue = [song('a'), song('b'), song('c')];
+      expect(insertIndexAfterManualSongs(queue, 0), 1);
+      expect(insertIndexAfterManualSongs(queue, 1), 2);
+    });
+
+    test('skips songs the user queued by hand', () {
+      final queue = [
+        song('now'),
+        song('m1', manual: true),
+        song('m2', manual: true),
+        song('rest'),
+      ];
+      expect(insertIndexAfterManualSongs(queue, 0), 3);
+    });
+
+    test('does not skip auto-picked songs or manual songs further down', () {
+      final queue = [
+        song('now'),
+        song('auto', manual: true, auto: true),
+        song('rest'),
+        song('m', manual: true),
+      ];
+      expect(insertIndexAfterManualSongs(queue, 0), 1);
+    });
+
+    test('handles the end of the queue and an empty queue', () {
+      expect(insertIndexAfterManualSongs([song('only')], 0), 1);
+      expect(insertIndexAfterManualSongs([], 0), 0);
+      expect(insertIndexAfterManualSongs([song('a')], 5), 1);
+    });
+  });
+
   group('appendedQueueIndexForSourceIndex', () {
     test('accounts for existing queue entries', () {
       expect(

@@ -26,6 +26,19 @@ int indexAfterQueueReorder(int index, int oldIndex, int newIndex) {
   return index;
 }
 
+/// Where songs picked for the user belong in [queue]: after the current song
+/// and the songs the user queued by hand to play next, so those still come
+/// first.
+int insertIndexAfterManualSongs(List<Map> queue, int currentIndex) {
+  var index = currentIndex + 1;
+  while (index < queue.length &&
+      queue[index]['isManuallyAdded'] == true &&
+      queue[index]['isAutoPicked'] != true) {
+    index++;
+  }
+  return index.clamp(0, queue.length);
+}
+
 int? appendedQueueIndexForSourceIndex(
   List<Map> songs,
   int sourceIndex,

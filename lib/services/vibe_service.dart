@@ -29,7 +29,7 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 /// How many of the best pre-ranked candidates get a full metadata lookup
 /// (tags + description) before the final ranking.
-const _detailLookups = 10;
+const _detailLookups = 14;
 const _requestTimeout = Duration(seconds: 8);
 
 VibeProfile _profileOf(Video video) => buildVibeProfile(
@@ -41,12 +41,25 @@ VibeProfile _profileOf(Video video) => buildVibeProfile(
   durationSeconds: video.duration?.inSeconds,
 );
 
-class _Candidate {
-  _Candidate(this.video, {this.relatedRank});
+/// Pairs a candidate with the video it was built from.
+class _Entry {
+  _Entry(this.video, int? relatedRank)
+    : candidate = VibeCandidate(
+        profile: _profileOf(video),
+        title: video.title,
+        relatedRank: relatedRank,
+      );
 
   Video video;
-  final int? relatedRank;
-  double score = 0;
+  final VibeCandidate candidate;
+
+  /// Re-reads the profile once the full video details are known.
+  void update(Video detailed) {
+    video = detailed;
+    candidate
+      ..profile = _profileOf(detailed)
+      ..title = detailed.title;
+  }
 }
 
 /// The vibe of the song with id [ytid], or null when it cannot be looked up.
@@ -73,12 +86,12 @@ Future<List<Map<String, dynamic>>> fetchVibeMatches(
   int limit = 10,
 }) async {
   try {
-    final pool = <String, _Candidate>{};
+    final pool = <String, _Entry>{};
 
     void add(Video video, {int? relatedRank}) {
       final id = video.id.value;
       if (id == seed.ytid || excludedYtIds.contains(id) || video.isLive) return;
-      pool.putIfAbsent(id, () => _Candidate(video, relatedRank: relatedRank));
+      pool.putIfAbsent(id, () => _Entry(video, relatedRank));
     }
 
     var relatedCount = 0;
@@ -123,50 +136,45 @@ Future<List<Map<String, dynamic>>> fetchVibeMatches(
 
     if (pool.isEmpty) return [];
 
-    void rank(Iterable<_Candidate> candidates) {
-      for (final c in candidates) {
-        c.score = scoreVibeMatch(
-          seed,
-          _profileOf(c.video),
-          c.video.title,
-          relatedRank: c.relatedRank,
-          relatedCount: relatedCount,
-        );
-      }
-    }
+    // First pass: rank on titles alone, since search and related results
+    // carry no tags or description.
+    final entries = pool.values.toList();
+    final firstPass = selectVibeMatches(
+      seed,
+      [for (final e in entries) e.candidate],
+      relatedCount: relatedCount,
+      limit: _detailLookups,
+      floorScore: double.negativeInfinity,
+    );
 
-    final all = pool.values.toList();
-    rank(all);
-    all.sort((a, b) => b.score.compareTo(a.score));
-
-    // Second pass: search and related results carry no tags or description,
-    // so fetch them for the front-runners and score those again.
-    final shortlist = all.take(_detailLookups).toList();
+    // Second pass: look the front-runners up in full and rank again.
+    final shortlist = entries
+        .where((e) => firstPass.contains(e.candidate))
+        .toList();
     await Future.wait(
-      shortlist.map((c) async {
+      shortlist.map((e) async {
         try {
-          c.video = await ytClient.videos
-              .get(c.video.id.value)
-              .timeout(_requestTimeout);
+          e.update(
+            await ytClient.videos
+                .get(e.video.id.value)
+                .timeout(_requestTimeout),
+          );
         } catch (_) {
           // Keep the title-only candidate; it was still ranked.
         }
       }),
     );
-    rank(shortlist);
-    all.sort((a, b) => b.score.compareTo(a.score));
 
-    // Anything scoring this low clashes with the seed's vibe; better to
-    // return fewer songs than a track that breaks the mood.
-    const minScore = -1.0;
-    final matches = all.where((c) => c.score >= minScore).toList();
-
-    final ranked = limitPerArtist<_Candidate>(
-      matches,
-      (c) => c.video.author,
-    ).take(limit);
-
-    return ranked.map((c) => returnSongLayout(0, c.video)).toList();
+    final byCandidate = {for (final e in entries) e.candidate: e};
+    final finalists = selectVibeMatches(
+      seed,
+      [for (final e in shortlist) e.candidate],
+      relatedCount: relatedCount,
+      limit: limit,
+    );
+    return [
+      for (final c in finalists) returnSongLayout(0, byCandidate[c]!.video),
+    ];
   } catch (e, stackTrace) {
     logger.log('Error fetching vibe matches', error: e, stackTrace: stackTrace);
     return [];

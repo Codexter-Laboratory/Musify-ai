@@ -97,6 +97,7 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
   final ValueNotifier<VibeProfile?> vibeRadioNotifier = ValueNotifier(null);
   bool _vibeRadioFromShuffle = false;
   Future<bool>? _vibeRefill;
+  bool _vibeStarting = false;
 
   // Playback transition and state-update coordination.
   bool _isUpdatingState = false;
@@ -915,10 +916,12 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
   ///
   /// Returns the detected vibe, or null when nothing similar was found.
   Future<VibeProfile?> playMoreLikeThis({bool fromShuffle = false}) async {
-    try {
-      final seedId = _getCurrentSongForRecommendations()?['ytid']?.toString();
-      if (offlineMode.value || seedId == null || seedId.isEmpty) return null;
+    if (_vibeStarting) return null;
+    final seedId = _getCurrentSongForRecommendations()?['ytid']?.toString();
+    if (offlineMode.value || seedId == null || seedId.isEmpty) return null;
 
+    _vibeStarting = true;
+    try {
       final seed = await fetchVibeProfile(seedId);
       if (seed == null) return null;
 
@@ -939,11 +942,16 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
       _ensureCurrentSongInQueue();
       vibeRadioNotifier.value = seed;
       _vibeRadioFromShuffle = fromShuffle;
-      _insertVibeSongs(matches, _currentQueueIndex + 1);
+      _insertVibeSongs(
+        matches,
+        insertIndexAfterManualSongs(_queueList, _currentQueueIndex),
+      );
       return seed;
     } catch (e, stackTrace) {
       logger.log('Error starting vibe radio', error: e, stackTrace: stackTrace);
       return null;
+    } finally {
+      _vibeStarting = false;
     }
   }
 
