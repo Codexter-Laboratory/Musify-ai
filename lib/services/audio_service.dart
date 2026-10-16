@@ -24,6 +24,7 @@ import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
+import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:musify/constants/clients.dart';
@@ -34,10 +35,12 @@ import 'package:musify/services/common_services.dart';
 import 'package:musify/services/data_manager.dart';
 import 'package:musify/services/listening_stats_service.dart';
 import 'package:musify/services/settings_manager.dart';
+import 'package:musify/services/vibe_service.dart';
 import 'package:musify/utilities/map_utils.dart';
 import 'package:musify/utilities/media_duration.dart';
 import 'package:musify/utilities/mediaitem.dart';
 import 'package:musify/utilities/queue_entry_utils.dart';
+import 'package:musify/utilities/vibe_utils.dart';
 import 'package:rxdart/rxdart.dart';
 
 class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
@@ -88,6 +91,13 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
   int _currentQueueIndex = 0;
   int _currentLoadingIndex = -1;
   int _currentLoadingTransitionId = -1;
+
+  // "Play more like this": while a vibe is set, the queue keeps refilling with
+  // songs that match it instead of stopping at the end.
+  final ValueNotifier<VibeProfile?> vibeRadioNotifier = ValueNotifier(null);
+  bool _vibeRadioFromShuffle = false;
+  Future<bool>? _vibeRefill;
+  bool _vibeStarting = false;
 
   // Playback transition and state-update coordination.
   bool _isUpdatingState = false;
@@ -868,16 +878,8 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
     if (baseYtid == null || baseYtid.isEmpty) return;
 
     try {
-      final knownYtids = <String>{};
-      for (final song in _queueList) {
-        if (song['ytid'] != null) knownYtids.add(song['ytid'].toString());
-      }
-      for (final song in _historyList) {
-        if (song['ytid'] != null) knownYtids.add(song['ytid'].toString());
-      }
-
       final recommended =
-          await getSimilarSong(baseYtid, excludedYtIds: knownYtids).timeout(
+          await getSimilarSong(baseYtid, excludedYtIds: _knownYtIds()).timeout(
             const Duration(seconds: 10),
             onTimeout: () {
               logger.log('Background song fetch timed out');
@@ -900,6 +902,139 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
         stackTrace: stackTrace,
       );
     }
+  }
+
+  /// Ids of every song already queued or played.
+  Set<String> _knownYtIds() => {
+    for (final song in [..._queueList, ..._historyList])
+      if (song['ytid'] != null) song['ytid'].toString(),
+  };
+
+  /// Starts a vibe radio seeded by the current song: queues songs matching
+  /// its genre, mood and energy right after it, and keeps topping the queue
+  /// up with more of the same once it runs low.
+  ///
+  /// Returns the detected vibe, or null when nothing similar was found.
+  Future<VibeProfile?> playMoreLikeThis({bool fromShuffle = false}) async {
+    if (_vibeStarting) return null;
+    final seedId = _getCurrentSongForRecommendations()?['ytid']?.toString();
+    if (offlineMode.value || seedId == null || seedId.isEmpty) return null;
+
+    _vibeStarting = true;
+    try {
+      final seed = await fetchVibeProfile(seedId);
+      if (seed == null) return null;
+
+      // Give up if the user moved on to another song while this loaded.
+      if (_getCurrentSongForRecommendations()?['ytid']?.toString() != seedId) {
+        return null;
+      }
+
+      final matches = await fetchVibeMatches(
+        seed,
+        excludedYtIds: _knownYtIds(),
+      );
+      if (matches.isEmpty ||
+          _getCurrentSongForRecommendations()?['ytid']?.toString() != seedId) {
+        return null;
+      }
+
+      _ensureCurrentSongInQueue();
+      vibeRadioNotifier.value = seed;
+      _vibeRadioFromShuffle = fromShuffle;
+      _insertVibeSongs(
+        matches,
+        insertIndexAfterManualSongs(_queueList, _currentQueueIndex),
+      );
+      return seed;
+    } catch (e, stackTrace) {
+      logger.log('Error starting vibe radio', error: e, stackTrace: stackTrace);
+      return null;
+    } finally {
+      _vibeStarting = false;
+    }
+  }
+
+  /// Ends the vibe radio. Songs already queued stay queued.
+  void stopVibeRadio() {
+    _vibeRadioFromShuffle = false;
+    vibeRadioNotifier.value = null;
+  }
+
+  /// A song started with [playSong] directly never entered the queue, so
+  /// make the playing song the queue's only entry before adding to it.
+  void _ensureCurrentSongInQueue() {
+    final current = _getCurrentSongForRecommendations();
+    if (current == null) return;
+
+    if (_hasCurrentQueueIndex &&
+        _queueList[_currentQueueIndex]['ytid']?.toString() ==
+            current['ytid']?.toString()) {
+      return;
+    }
+
+    _queueList
+      ..clear()
+      ..add(_queueEntryIds.createSong(current));
+    _originalQueueList.clear();
+    _originalQueueEntriesById.clear();
+    _currentQueueIndex = 0;
+  }
+
+  void _insertVibeSongs(List<Map> songs, int index) {
+    final entries = [
+      for (final song in songs)
+        _queueEntryIds.createSong(song)..['isAutoPicked'] = true,
+    ];
+    if (shuffleNotifier.value) entries.shuffle();
+
+    _queueList.insertAll(index.clamp(0, _queueList.length), entries);
+    if (shuffleNotifier.value && _originalQueueList.isNotEmpty) {
+      _originalQueueList.addAll(cloneMaps(entries));
+      _rebuildOriginalQueueEntryIndex();
+    }
+
+    _hydrateQueueEntryIds();
+    _updateQueueMediaItems();
+    _cleanupOldPreloadedSongs();
+    _preloadUpcomingSongs();
+    _updatePlaybackState(force: true);
+  }
+
+  /// Appends more songs matching the vibe radio's seed when fewer than
+  /// [minUpcoming] are left. Resolves to whether any were added; calls made
+  /// while a refill is running share its result.
+  Future<bool> _refillVibeQueue({int minUpcoming = 1}) {
+    final seed = vibeRadioNotifier.value;
+    if (seed == null || offlineMode.value) return Future.value(false);
+    if (_vibeRefill case final running?) return running;
+    if (_queueList.length - 1 - _currentQueueIndex >= minUpcoming) {
+      return Future.value(false);
+    }
+
+    final refill = () async {
+      try {
+        final matches = await fetchVibeMatches(
+          seed,
+          excludedYtIds: _knownYtIds(),
+          limit: 8,
+        );
+        // The radio may have been stopped or restarted meanwhile.
+        if (vibeRadioNotifier.value != seed || matches.isEmpty) return false;
+        _insertVibeSongs(matches, _queueList.length);
+        return true;
+      } catch (e, stackTrace) {
+        logger.log(
+          'Error refilling vibe radio',
+          error: e,
+          stackTrace: stackTrace,
+        );
+        return false;
+      } finally {
+        _vibeRefill = null;
+      }
+    }();
+    return _vibeRefill = refill;
   }
 
   Map? _getCurrentSongForRecommendations() {
@@ -1052,6 +1187,7 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
       final manuallyAddedSongs = replace ? _getUnplayedManualSongs() : <Map>[];
       final shuffleAfterReplace = shuffle ?? shuffleNotifier.value;
       if (replace) {
+        stopVibeRadio();
         _queueList.clear();
         _originalQueueList.clear();
         _originalQueueEntriesById.clear();
@@ -1129,6 +1265,12 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
         await _playFromQueue(appendedStartQueueIndex);
       } else if (replace && _queueList.isNotEmpty) {
         await _playFromQueue(0);
+      }
+
+      // With shuffle already on, a lone song (e.g. a search result) has
+      // nothing to shuffle, so carry on with songs matching its vibe.
+      if (replace && shuffleAfterReplace && newSongs.length == 1) {
+        unawaited(playMoreLikeThis(fromShuffle: true));
       }
     } catch (e, stackTrace) {
       logger.log(
@@ -1240,6 +1382,7 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
           ? cloneMap(_queueList[_currentQueueIndex])
           : null;
 
+      stopVibeRadio();
       _queueList.clear();
       _originalQueueList.clear();
       _originalQueueEntriesById.clear();
@@ -1391,6 +1534,9 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
           if (playNextSongAutomatically.value) {
             unawaited(_backgroundAddSongsToQueue());
           }
+          // Top the vibe radio up early so the next song is already queued
+          // when this one ends.
+          unawaited(_refillVibeQueue(minUpcoming: 3));
         } else {
           _currentQueueIndex = previousQueueIndex;
           if (previousMediaItem != null) {
@@ -2404,6 +2550,8 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
       } else if (repeatNotifier.value == AudioServiceRepeatMode.all &&
           _queueList.isNotEmpty) {
         await _playFromQueue(0);
+      } else if (_currentLoadingIndex == -1 && await _refillVibeQueue()) {
+        await _playFromQueue(_currentQueueIndex + 1);
       } else if (playNextSongAutomatically.value &&
           _currentLoadingIndex == -1) {
         // At end of queue with auto-play enabled - trigger background fetch
@@ -2563,6 +2711,17 @@ class MusifyAudioHandler extends BaseAudioHandler implements AndroidAutoHost {
       shuffleNotifier.value = shuffleEnabled;
       unawaited(Hive.box('settings').put('shuffleEnabled', shuffleEnabled));
       await audioPlayer.setShuffleModeEnabled(shuffleEnabled);
+
+      if (!shuffleEnabled && _vibeRadioFromShuffle) stopVibeRadio();
+
+      // A lone song has nothing to shuffle and would just stop when it ends,
+      // so shuffle keeps the music going with songs that match its vibe.
+      if (shuffleEnabled &&
+          !wasShuffled &&
+          _queueList.length <= 1 &&
+          vibeRadioNotifier.value == null) {
+        unawaited(playMoreLikeThis(fromShuffle: true));
+      }
 
       if (_queueList.isEmpty) return;
 
