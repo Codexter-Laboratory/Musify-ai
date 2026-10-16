@@ -31,6 +31,7 @@ import 'package:musify/utilities/flutter_bottom_sheet.dart';
 import 'package:musify/utilities/flutter_toast.dart';
 import 'package:musify/utilities/mediaitem.dart';
 import 'package:musify/utilities/playlist_dialogs.dart';
+import 'package:musify/utilities/vibe_utils.dart';
 import 'package:musify/widgets/queue_list_view.dart';
 
 class BottomActionsRow extends StatefulWidget {
@@ -53,6 +54,7 @@ class BottomActionsRow extends StatefulWidget {
 class _BottomActionsRowState extends State<BottomActionsRow> {
   late final ValueNotifier<bool> _songLikeStatus;
   late final ValueNotifier<bool> _songOfflineStatus;
+  final ValueNotifier<bool> _vibeLoading = ValueNotifier(false);
   late final String? audioId = widget.metadata.extras?['ytid'];
   late final bool isRadioStation = widget.metadata.extras?['isLive'] ?? false;
 
@@ -115,6 +117,7 @@ class _BottomActionsRowState extends State<BottomActionsRow> {
     userOfflineSongs.removeListener(_syncOfflineStatus);
     _songLikeStatus.dispose();
     _songOfflineStatus.dispose();
+    _vibeLoading.dispose();
     super.dispose();
   }
 
@@ -164,6 +167,8 @@ class _BottomActionsRowState extends State<BottomActionsRow> {
               ),
               tooltip: l10n.addToPlaylist,
             ),
+          if (!offlineMode.value && !isRadioStation)
+            _buildVibeButton(context, colorScheme, responsiveIconSize),
           if (queue.isNotEmpty && !isRadioStation && !widget.isLargeScreen)
             _buildSimpleActionButton(
               context: context,
@@ -295,6 +300,81 @@ class _BottomActionsRowState extends State<BottomActionsRow> {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
       onPressed: onPressed,
+    );
+  }
+
+  Widget _buildVibeButton(
+    BuildContext context,
+    ColorScheme colorScheme,
+    double size,
+  ) {
+    return ValueListenableBuilder<VibeProfile?>(
+      valueListenable: audioHandler.vibeRadioNotifier,
+      builder: (_, vibe, __) {
+        final isActive = vibe != null;
+        return ValueListenableBuilder<bool>(
+          valueListenable: _vibeLoading,
+          builder: (_, isLoading, __) {
+            return IconButton(
+              icon: isLoading
+                  ? SizedBox.square(
+                      dimension: size * 0.8,
+                      child: const CircularProgressIndicator(strokeWidth: 2.5),
+                    )
+                  : Icon(
+                      isActive
+                          ? FluentIcons.sparkle_24_filled
+                          : FluentIcons.sparkle_24_regular,
+                      color: isActive
+                          ? colorScheme.primary
+                          : colorScheme.onSurfaceVariant,
+                    ),
+              iconSize: size,
+              tooltip: isActive
+                  ? context.l10n!.stopPlayingMoreLikeThis
+                  : context.l10n!.playMoreLikeThis,
+              style: IconButton.styleFrom(
+                backgroundColor: isActive
+                    ? colorScheme.primary.withValues(alpha: 0.15)
+                    : Colors.transparent,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              onPressed: isLoading
+                  ? null
+                  : () => _toggleVibe(context, isActive),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleVibe(BuildContext context, bool isActive) async {
+    final l10n = context.l10n!;
+
+    if (isActive) {
+      audioHandler.stopVibeRadio();
+      showToast(context, l10n.moreLikeThisStopped);
+      return;
+    }
+
+    _vibeLoading.value = true;
+    final vibe = await audioHandler.playMoreLikeThis();
+    if (!mounted) return;
+    _vibeLoading.value = false;
+
+    final label = vibe?.label ?? '';
+    showToast(
+      context,
+      vibe == null
+          ? l10n.moreLikeThisNotFound
+          : label.isEmpty
+          ? l10n.playingMoreLikeThis
+          : '${l10n.playingMoreLikeThis} · $label',
+      icon: FluentIcons.sparkle_24_filled,
     );
   }
 
